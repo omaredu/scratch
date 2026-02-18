@@ -1987,14 +1987,22 @@ fn check_cli_exists(command_name: &str, path: &str) -> Result<bool, String> {
 
 #[tauri::command]
 async fn ai_check_claude_cli() -> Result<bool, String> {
-    let path = get_expanded_path();
-    check_cli_exists("claude", &path)
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = get_expanded_path();
+        check_cli_exists("claude", &path)
+    })
+    .await
+    .map_err(|e| format!("Failed to check Claude CLI: {}", e))?
 }
 
 #[tauri::command]
 async fn ai_check_codex_cli() -> Result<bool, String> {
-    let path = get_expanded_path();
-    check_cli_exists("codex", &path)
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = get_expanded_path();
+        check_cli_exists("codex", &path)
+    })
+    .await
+    .map_err(|e| format!("Failed to check Codex CLI: {}", e))?
 }
 
 /// Shared AI CLI execution: spawns `command` with `args`, writes `stdin_input` to stdin,
@@ -2009,15 +2017,6 @@ async fn execute_ai_cli(
     use std::io::Write;
     use std::process::{Child, Command, Stdio};
 
-    let path = get_expanded_path();
-    if !check_cli_exists(&command, &path)? {
-        return Ok(AiExecutionResult {
-            success: false,
-            output: String::new(),
-            error: Some(not_found_msg),
-        });
-    }
-
     let cli_name = cli_name.to_string();
     let timeout_duration = std::time::Duration::from_secs(300);
     let shared_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
@@ -2025,100 +2024,138 @@ async fn execute_ai_cli(
     let cli_name_task = cli_name.clone();
 
     let mut task = tauri::async_runtime::spawn_blocking(move || {
+        // Blocking I/O: expand PATH and check CLI exists
+        let path = get_expanded_path();
+        match check_cli_exists(&command, &path) {
+            Ok(false) => {
+                return AiExecutionResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(not_found_msg),
+                };
+            }
+            Err(e) => {
+                return AiExecutionResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e),
+                };
+            }
+            Ok(true) => {}
+        }
+
         let mut cmd = Command::new(&command);
         cmd.env("PATH", &path);
         for arg in &args {
             cmd.arg(arg);
         }
-        let child = cmd
+        let process = match cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn();
-
-        match child {
-            Ok(process) => {
-                if let Ok(mut guard) = child_for_task.lock() {
-                    *guard = Some(process);
-                } else {
-                    return AiExecutionResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Failed to lock {} child process handle", cli_name_task)),
-                    };
-                }
-
-                let mut process = match child_for_task.lock() {
-                    Ok(mut guard) => match guard.take() {
-                        Some(p) => p,
-                        None => {
-                            return AiExecutionResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(format!("{} process handle was unexpectedly missing", cli_name_task)),
-                            };
-                        }
-                    },
-                    Err(_) => {
-                        return AiExecutionResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!("Failed to lock {} child process handle", cli_name_task)),
-                        };
-                    }
+            .spawn()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return AiExecutionResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute {}: {}", cli_name_task, e)),
                 };
-
-                if let Some(mut stdin) = process.stdin.take() {
-                    if let Err(e) = stdin.write_all(stdin_input.as_bytes()) {
-                        let _ = process.kill();
-                        let _ = process.wait();
-                        return AiExecutionResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!("Failed to write prompt to {} stdin: {}", cli_name_task, e)),
-                        };
-                    }
-                } else {
-                    let _ = process.kill();
-                    let _ = process.wait();
-                    return AiExecutionResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Failed to open stdin for {} process", cli_name_task)),
-                    };
-                }
-
-                match process.wait_with_output() {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-                        if output.status.success() {
-                            AiExecutionResult {
-                                success: true,
-                                output: stdout,
-                                error: None,
-                            }
-                        } else {
-                            AiExecutionResult {
-                                success: false,
-                                output: stdout,
-                                error: Some(stderr),
-                            }
-                        }
-                    }
-                    Err(e) => AiExecutionResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Failed to wait for {}: {}", cli_name_task, e)),
-                    },
-                }
             }
-            Err(e) => AiExecutionResult {
+        };
+
+        // Store process in shared state so the timeout handler can kill it.
+        // We only take individual I/O handles below — the Child stays in the
+        // mutex so it remains reachable for kill().
+        if let Ok(mut guard) = child_for_task.lock() {
+            *guard = Some(process);
+        } else {
+            return AiExecutionResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to execute {}: {}", cli_name_task, e)),
-            },
+                error: Some(format!("Failed to lock {} process handle", cli_name_task)),
+            };
+        }
+
+        // Take stdin handle (briefly locks then releases)
+        let stdin_handle = child_for_task
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|p| p.stdin.take()));
+
+        if let Some(mut stdin) = stdin_handle {
+            if let Err(e) = stdin.write_all(stdin_input.as_bytes()) {
+                if let Ok(mut g) = child_for_task.lock() {
+                    if let Some(ref mut p) = *g {
+                        let _ = p.kill();
+                        let _ = p.wait();
+                    }
+                }
+                return AiExecutionResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to write to {} stdin: {}", cli_name_task, e)),
+                };
+            }
+            // stdin dropped here — closes the pipe
+        } else {
+            if let Ok(mut g) = child_for_task.lock() {
+                if let Some(ref mut p) = *g {
+                    let _ = p.kill();
+                    let _ = p.wait();
+                }
+            }
+            return AiExecutionResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to open stdin for {}", cli_name_task)),
+            };
+        }
+
+        // Take stdout/stderr handles so we can read without holding the lock.
+        // This allows the timeout handler to lock the mutex and kill the process.
+        let stdout_handle = child_for_task
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|p| p.stdout.take()));
+        let stderr_handle = child_for_task
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|p| p.stderr.take()));
+
+        use std::io::Read;
+
+        let mut stdout_str = String::new();
+        if let Some(mut out) = stdout_handle {
+            let _ = out.read_to_string(&mut stdout_str);
+        }
+
+        let mut stderr_str = String::new();
+        if let Some(mut err) = stderr_handle {
+            let _ = err.read_to_string(&mut stderr_str);
+        }
+
+        // Collect exit status — process has exited after stdout/stderr close
+        let success = child_for_task
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|p| p.wait().ok()))
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if success {
+            AiExecutionResult {
+                success: true,
+                output: stdout_str,
+                error: None,
+            }
+        } else {
+            AiExecutionResult {
+                success: false,
+                output: stdout_str,
+                error: Some(stderr_str),
+            }
         }
     });
 
@@ -2127,10 +2164,12 @@ async fn execute_ai_cli(
             join_result.map_err(|e| format!("Failed to join {} blocking task: {}", cli_name, e))?
         }
         Err(_) => {
+            // Kill through the shared handle — the Child is still in the mutex
+            // because the blocking task only takes I/O handles, not the Child.
+            // This sends SIGKILL, which closes the pipes and unblocks the reads.
             if let Ok(mut guard) = shared_child.lock() {
-                if let Some(mut process) = guard.take() {
+                if let Some(ref mut process) = *guard {
                     let _ = process.kill();
-                    let _ = process.wait();
                 }
             }
 
